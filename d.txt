@@ -1,0 +1,1205 @@
+import os
+from flask import Flask, request, render_template_string, session, redirect, url_for, send_from_directory, jsonify, abort
+from functools import wraps
+from pymongo import MongoClient
+from werkzeug.utils import secure_filename
+from PIL import Image
+from slugify import slugify
+import datetime
+from datetime import timedelta
+import uuid
+import json
+import csv
+from io import StringIO
+from bson.objectid import ObjectId
+from jinja2 import Environment, DictLoader
+
+app = Flask(__name__)
+app.secret_key = os.environ.get('SECRET_KEY', 'default_secret')
+
+MONGO_URI = os.environ.get('MONGO_URI')
+ADMIN_USER = os.environ.get('ADMIN_USER', 'admin')
+ADMIN_PASS = os.environ.get('ADMIN_PASS', 'admin123')
+SITE_NAME = os.environ.get('SITE_NAME', 'TeeLux')
+BASE_URL = os.environ.get('BASE_URL', 'http://localhost:5000')
+ASSET_DIR = os.environ.get('ASSET_DIR', 'uploads')
+os.makedirs(ASSET_DIR, exist_ok=True)
+
+client = MongoClient(MONGO_URI)
+db = client.get_default_database()
+products_db = db.products
+orders_db = db.orders
+coupons_db = db.coupons
+settings_db = db.settings
+reviews_db = db.reviews
+counters_db = db.counters
+
+def format_money(value):
+    return f"৳{value:,.2f}"
+
+def generate_slug(name):
+    return slugify(name)
+
+def get_next_sequence(name):
+    counter = counters_db.find_one_and_update(
+        {'_id': name},
+        {'$inc': {'seq': 1}},
+        upsert=True,
+        return_document=True
+    )
+    return counter['seq']
+
+def upload_file(file, resize=(800, 800), quality=85):
+    if not file:
+        return None
+    filename = secure_filename(file.filename)
+    ext = filename.rsplit('.', 1)[1].lower() if '.' in filename else ''
+    if ext not in ('jpg', 'jpeg', 'png'):
+        return None
+    unique = f"{uuid.uuid4()}.{ext}"
+    path = os.path.join(ASSET_DIR, unique)
+    img = Image.open(file)
+    img.thumbnail(resize)
+    img.save(path, format=img.format.upper(), optimize=True, quality=quality)
+    return unique
+
+# Note: For production on Heroku, use S3 or similar for file storage; local files are ephemeral.
+
+def get_settings():
+    s = settings_db.find_one({'_id': 'main'})
+    if not s:
+        s = {
+            '_id': 'main',
+            'brand': SITE_NAME,
+            'support_phone': '',
+            'support_email': '',
+            'bkash_number': '',
+            'nagad_number': '',
+            'verification_sla': '24',
+            'seo': {},
+            'maintenance': False,
+            'shipping_methods': [{'name': 'Standard', 'fee': 100}, {'name': 'Express', 'fee': 200}],
+            'free_shipping_threshold': 0,
+            'banners': []
+        }
+        settings_db.insert_one(s)
+    return s
+
+@app.before_request
+def before_request():
+    if request.path.startswith('/admin') or request.path == '/health' or request.path.startswith('/uploads'):
+        return
+    s = get_settings()
+    if s.get('maintenance', False):
+        return render_template_string(templates['maintenance'])
+    if '_csrf_token' not in session:
+        session['_csrf_token'] = str(uuid.uuid4())
+
+def admin_required(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if 'admin' not in session:
+            return redirect(url_for('admin_login'))
+        return f(*args, **kwargs)
+    return decorated
+
+def seed_data():
+    if products_db.count_documents({}) == 0:
+        demo_products = [
+            {
+                'name': 'Half Sleeve T-Shirt',
+                'slug': generate_slug('Half Sleeve T-Shirt'),
+                'category': 'Men',
+                'tags': [],
+                'description': '<p>Comfortable half sleeve t-shirt for casual wear.</p>',
+                'images': [],
+                'price': 500.0,
+                'compare_at_price': 600.0,
+                'currency': 'BDT',
+                'variants': [
+                    {'color': 'White', 'size': 'M', 'sku': 'HS-W-M', 'stock': 10, 'price_override': None},
+                    {'color': 'Blue', 'size': 'L', 'sku': 'HS-B-L', 'stock': 5, 'price_override': None},
+                ],
+                'status': 'active',
+                'created_at': datetime.datetime.utcnow()
+            },
+            {
+                'name': 'Designer Short Sleeve',
+                'slug': generate_slug('Designer Short Sleeve'),
+                'category': 'Men',
+                'tags': [],
+                'description': '<p>Stylish designer short sleeve.</p>',
+                'images': [],
+                'price': 550.0,
+                'compare_at_price': 0.0,
+                'currency': 'BDT',
+                'variants': [
+                    {'color': 'Green', 'size': 'S', 'sku': 'DSS-G-S', 'stock': 8, 'price_override': None},
+                ],
+                'status': 'active',
+                'created_at': datetime.datetime.utcnow()
+            },
+            {
+                'name': 'Sports T-Shirt',
+                'slug': generate_slug('Sports T-Shirt'),
+                'category': 'Men',
+                'tags': [],
+                'description': '<p>Sports t-shirt for active lifestyle.</p>',
+                'images': [],
+                'price': 600.0,
+                'compare_at_price': 700.0,
+                'currency': 'BDT',
+                'variants': [
+                    {'color': 'Teal', 'size': 'XL', 'sku': 'ST-T-XL', 'stock': 12, 'price_override': None},
+                ],
+                'status': 'active',
+                'created_at': datetime.datetime.utcnow()
+            },
+            {
+                'name': 'Polo',
+                'slug': generate_slug('Polo'),
+                'category': 'Men',
+                'tags': [],
+                'description': '<p>Classic polo shirt.</p>',
+                'images': [],
+                'price': 800.0,
+                'compare_at_price': 0.0,
+                'currency': 'BDT',
+                'variants': [
+                    {'color': 'Blue', 'size': 'M', 'sku': 'P-B-M', 'stock': 15, 'price_override': None},
+                ],
+                'status': 'active',
+                'created_at': datetime.datetime.utcnow()
+            },
+            {
+                'name': 'Color Block Polo',
+                'slug': generate_slug('Color Block Polo'),
+                'category': 'Men',
+                'tags': [],
+                'description': '<p>Color block polo for modern look.</p>',
+                'images': [],
+                'price': 750.0,
+                'compare_at_price': 0.0,
+                'currency': 'BDT',
+                'variants': [
+                    {'color': 'Red', 'size': 'L', 'sku': 'CBP-R-L', 'stock': 10, 'price_override': None},
+                ],
+                'status': 'active',
+                'created_at': datetime.datetime.utcnow()
+            },
+            {
+                'name': 'Half Sleeve Raglan',
+                'slug': generate_slug('Half Sleeve Raglan'),
+                'category': 'Men',
+                'tags': [],
+                'description': '<p>Raglan sleeve t-shirt.</p>',
+                'images': [],
+                'price': 650.0,
+                'compare_at_price': 0.0,
+                'currency': 'BDT',
+                'variants': [
+                    {'color': 'Maroon', 'size': 'XL', 'sku': 'HSR-M-XL', 'stock': 7, 'price_override': None},
+                ],
+                'status': 'active',
+                'created_at': datetime.datetime.utcnow()
+            },
+            {
+                'name': "Kid's Superhero T-Shirt",
+                'slug': generate_slug("Kid's Superhero T-Shirt"),
+                'category': 'Kids',
+                'tags': [],
+                'description': '<p>Superhero themed t-shirt for kids.</p>',
+                'images': [],
+                'price': 400.0,
+                'compare_at_price': 0.0,
+                'currency': 'BDT',
+                'variants': [
+                    {'color': 'Purple', 'size': 'S', 'sku': 'KST-P-S', 'stock': 20, 'price_override': None},
+                ],
+                'status': 'active',
+                'created_at': datetime.datetime.utcnow()
+            },
+            {
+                'name': 'Aurum Premium Polo',
+                'slug': generate_slug('Aurum Premium Polo'),
+                'category': 'Men',
+                'tags': [],
+                'description': '<p>Premium polo shirt.</p>',
+                'images': [],
+                'price': 1200.0,
+                'compare_at_price': 0.0,
+                'currency': 'BDT',
+                'variants': [
+                    {'color': 'Brown', 'size': 'M', 'sku': 'APP-B-M', 'stock': 6, 'price_override': None},
+                ],
+                'status': 'active',
+                'created_at': datetime.datetime.utcnow()
+            },
+        ]
+        for p in demo_products:
+            p['colors'] = list(set(v['color'] for v in p['variants']))
+            p['sizes'] = list(set(v['size'] for v in p['variants']))
+            products_db.insert_one(p)
+    if coupons_db.count_documents({}) == 0:
+        coupons_db.insert_one({
+            'code': 'WELCOME10',
+            'type': 'percent',
+            'value': 10,
+            'min_order': 500,
+            'usage_limit': None,
+            'used_count': 0,
+            'expires_at': None,
+            'active': True
+        })
+    get_settings()  # Initialize if not present
+
+seed_data()
+
+templates = {
+    'maintenance': '''
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Maintenance - {{ site_name }}</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-100 dark:bg-gray-900 text-gray-900 dark:text-gray-100">
+    <div class="container mx-auto p-8 text-center">
+        <h1 class="text-4xl font-bold mb-4">Site Under Maintenance</h1>
+        <p>We'll be back soon! Please check back later.</p>
+    </div>
+</body>
+</html>
+    ''',
+    'base': '''
+<!doctype html>
+<html lang="en" x-data="{ darkMode: localStorage.theme === 'dark' || (!('theme' in localStorage) && window.matchMedia('(prefers-color-scheme: dark)').matches) }" :class="darkMode ? 'dark' : ''">
+<head>
+    <meta charset="UTF-8">
+    <title>{% block title %}{{ site_name }}{% endblock %}</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/htmx.org@1.9.6"></script>
+    <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
+    <script src="https://unpkg.com/lucide@latest"></script>
+    <style>
+        [x-cloak] { display: none; }
+        .card { transition: transform 0.2s, box-shadow 0.2s; }
+        .card:hover { transform: scale(1.02); box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
+        body { min-height: 100vh; display: flex; flex-direction: column; }
+        main { flex: 1; }
+    </style>
+    {% block head %}{% endblock %}
+</head>
+<body class="bg-white dark:bg-gray-900 text-gray-900 dark:text-gray-100">
+    <header class="sticky top-0 bg-white dark:bg-gray-800 shadow z-10">
+        <nav class="container mx-auto px-4 py-3 flex justify-between items-center">
+            <a href="/" class="text-2xl font-bold">{{ site_name }}</a>
+            <div class="flex items-center space-x-4">
+                <form action="/" method="get">
+                    <input name="search" placeholder="Search products..." class="border rounded px-2 py-1 dark:bg-gray-700 dark:border-gray-600">
+                </form>
+                <a href="/cart" class="flex items-center">
+                    <i data-lucide="shopping-cart" class="mr-1"></i>
+                    Cart (<span id="cart-count">{{ session.cart | length if session.cart else 0 }}</span>)
+                </a>
+                <button @click="darkMode = !darkMode; localStorage.theme = darkMode ? 'dark' : 'light'">
+                    <i data-lucide="moon" x-show="darkMode"></i>
+                    <i data-lucide="sun" x-show="!darkMode"></i>
+                </button>
+            </div>
+        </nav>
+    </header>
+    <main class="container mx-auto p-4">
+        {% block content %}{% endblock %}
+    </main>
+    <footer class="bg-gray-100 dark:bg-gray-800 py-4 mt-auto">
+        <div class="container mx-auto px-4 text-center">
+            <p>Contact: {{ support_phone }} | {{ support_email }}</p>
+            <p>© {{ year }} {{ site_name }}. All rights reserved.</p>
+        </div>
+    </footer>
+    <script>
+        lucide.createIcons();
+        document.addEventListener('htmx:afterSwap', () => lucide.createIcons());
+    </script>
+    {% block script %}{% endblock %}
+</body>
+</html>
+    ''',
+    'home': '''
+{% extends "base" %}
+{% block title %}{{ site_name }} - Home{% endblock %}
+{% block content %}
+<h1 class="text-3xl font-bold mb-6">New Arrivals</h1>
+<div class="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-5 gap-6">
+    {% for product in products %}
+    <div class="card bg-white dark:bg-gray-800 rounded-2xl shadow overflow-hidden">
+        <a href="/p/{{ product.slug }}">
+            {% if product.images %}
+            <img src="/uploads/{{ product.images[0] }}" alt="{{ product.name }}" class="w-full h-48 object-cover">
+            {% else %}
+            <div class="w-full h-48 bg-gray-200 flex items-center justify-center">No Image</div>
+            {% endif %}
+        </a>
+        <div class="p-4">
+            <h3 class="font-semibold mb-2">{{ product.name }}</h3>
+            <p class="text-lg font-bold">{{ format_money(product.price) }}</p>
+            {% if product.compare_at_price > product.price %}
+            <span class="text-sm text-red-500 line-through">{{ format_money(product.compare_at_price) }}</span>
+            <span class="badge bg-red-500 text-white px-2 py-1 rounded">Sale</span>
+            {% endif %}
+            <button hx-post="/cart/add" hx-vals='{"product_id": "{{ product._id }}", "color": "{{ product.variants[0].color }}", "size": "{{ product.variants[0].size }}", "qty": 1}' hx-swap="none" class="mt-2 bg-blue-500 text-white px-4 py-2 rounded hover:bg-blue-600">Add to Cart</button>
+        </div>
+    </div>
+    {% endfor %}
+</div>
+<!-- Pagination -->
+<div class="mt-8 flex justify-center">
+    {% if page > 1 %}
+    <a href="?page={{ page - 1 }}" class="px-4 py-2 bg-gray-200 rounded">Previous</a>
+    {% endif %}
+    <span class="px-4 py-2">Page {{ page }} of {{ pages }}</span>
+    {% if page < pages %}
+    <a href="?page={{ page + 1 }}" class="px-4 py-2 bg-gray-200 rounded">Next</a>
+    {% endif %}
+</div>
+{% endblock %}
+    ''',
+    'product_detail': '''
+{% extends "base" %}
+{% block title %}{{ product.name }} - {{ site_name }}{% endblock %}
+{% block content %}
+<div class="grid md:grid-cols-2 gap-8">
+    <div>
+        {% if product.images %}
+        <img src="/uploads/{{ product.images[0] }}" alt="{{ product.name }}" class="w-full rounded-2xl shadow">
+        <div class="flex mt-4 space-x-2">
+            {% for img in product.images[1:] %}
+            <img src="/uploads/{{ img }}" alt="" class="w-20 h-20 object-cover rounded cursor-pointer">
+            {% endfor %}
+        </div>
+        {% else %}
+        <div class="w-full h-64 bg-gray-200 flex items-center justify-center rounded-2xl">No Image</div>
+        {% endif %}
+    </div>
+    <div>
+        <h1 class="text-3xl font-bold mb-2">{{ product.name }}</h1>
+        <p class="text-2xl font-bold mb-4">{{ format_money(product.price) }}</p>
+        {% if product.compare_at_price > product.price %}
+        <p class="text-lg text-red-500 line-through">{{ format_money(product.compare_at_price) }}</p>
+        {% endif %}
+        <form hx-post="/cart/add" x-data="{ color: '{{ product.variants[0].color }}', size: '{{ product.variants[0].size }}', qty: 1 }">
+            <div class="mb-4">
+                <label>Color:</label>
+                <select x-model="color">
+                    {% for color in product.colors %}
+                    <option>{{ color }}</option>
+                    {% endfor %}
+                </select>
+            </div>
+            <div class="mb-4">
+                <label>Size:</label>
+                <select x-model="size">
+                    {% for size in product.sizes %}
+                    <option>{{ size }}</option>
+                    {% endfor %}
+                </select>
+            </div>
+            <div class="mb-4">
+                <label>Quantity:</label>
+                <input type="number" x-model="qty" min="1" class="w-16 border rounded px-2 py-1">
+            </div>
+            <input type="hidden" name="product_id" value="{{ product._id }}">
+            <input type="hidden" name="color" x-bind:value="color">
+            <input type="hidden" name="size" x-bind:value="size">
+            <input type="hidden" name="qty" x-bind:value="qty">
+            <button type="submit" class="bg-blue-500 text-white px-6 py-3 rounded hover:bg-blue-600">Add to Cart</button>
+        </form>
+        <div class="mt-8" x-html="description">
+            {{ product.description | safe }}
+        </div>
+    </div>
+</div>
+<div class="mt-12">
+    <h2 class="text-2xl font-bold mb-4">Reviews</h2>
+    {% for review in reviews %}
+    <div class="mb-4">
+        <p><strong>{{ review.name }}</strong> - {{ review.rating }} stars</p>
+        <p>{{ review.comment }}</p>
+    </div>
+    {% endfor %}
+    <form method="post" action="/p/{{ product.slug }}/review">
+        <input type="hidden" name="_csrf_token" value="{{ csrf_token }}">
+        <input name="name" placeholder="Your Name" class="border rounded px-2 py-1 mb-2">
+        <input name="rating" type="number" min="1" max="5" placeholder="Rating" class="border rounded px-2 py-1 mb-2">
+        <textarea name="comment" placeholder="Comment" class="border rounded px-2 py-1 mb-2"></textarea>
+        <button type="submit" class="bg-green-500 text-white px-4 py-2 rounded">Submit Review</button>
+    </form>
+</div>
+{% endblock %}
+    ''',
+    'cart': '''
+{% extends "base" %}
+{% block title %}Cart - {{ site_name }}{% endblock %}
+{% block content %}
+<h1 class="text-3xl font-bold mb-6">Shopping Cart</h1>
+<div id="cart-items">
+    {% for item in cart %}
+    <div class="flex items-center mb-4">
+        <img src="/uploads/{{ item.product.images[0] if item.product.images else 'placeholder.jpg' }}" alt="{{ item.product.name }}" class="w-20 h-20 object-cover rounded">
+        <div class="ml-4 flex-1">
+            <h3>{{ item.product.name }} - {{ item.variant.color }} / {{ item.variant.size }}</h3>
+            <p>{{ format_money(item.price) }} x {{ item.qty }} = {{ format_money(item.price * item.qty) }}</p>
+        </div>
+        <button hx-post="/cart/remove" hx-vals='{"index": {{ loop.index0 }}}' hx-target="#cart-items" hx-swap="outerHTML" class="text-red-500">Remove</button>
+    </div>
+    {% endfor %}
+</div>
+<div class="mt-8">
+    <form hx-post="/cart/apply_coupon" hx-target="#cart-summary" hx-swap="outerHTML">
+        <input name="code" placeholder="Coupon Code" class="border rounded px-2 py-1">
+        <button type="submit" class="bg-blue-500 text-white px-4 py-2 rounded">Apply</button>
+    </form>
+    <div id="cart-summary" class="mt-4">
+        <p>Subtotal: {{ format_money(subtotal) }}</p>
+        <p>Discount: {{ format_money(discount) }}</p>
+        <p>Total: {{ format_money(total) }}</p>
+    </div>
+    <a href="/checkout" class="bg-green-500 text-white px-6 py-3 rounded hover:bg-green-600">Proceed to Checkout</a>
+</div>
+{% endblock %}
+    ''',
+    'checkout': '''
+{% extends "base" %}
+{% block title %}Checkout - {{ site_name }}{% endblock %}
+{% block content %}
+<h1 class="text-3xl font-bold mb-6">Checkout</h1>
+<form method="post">
+    <input type="hidden" name="_csrf_token" value="{{ csrf_token }}">
+    <div class="grid md:grid-cols-2 gap-8">
+        <div>
+            <h2 class="text-2xl mb-4">Billing Details</h2>
+            <input name="name" placeholder="Full Name" class="block w-full border rounded px-2 py-1 mb-2">
+            <input name="phone" placeholder="Phone" class="block w-full border rounded px-2 py-1 mb-2">
+            <input name="email" placeholder="Email" class="block w-full border rounded px-2 py-1 mb-2">
+            <textarea name="address" placeholder="Address" class="block w-full border rounded px-2 py-1 mb-2"></textarea>
+            <input name="city" placeholder="City" class="block w-full border rounded px-2 py-1 mb-2">
+            <input name="postal_code" placeholder="Postal Code" class="block w-full border rounded px-2 py-1 mb-2">
+            <textarea name="delivery_note" placeholder="Delivery Note" class="block w-full border rounded px-2 py-1 mb-2"></textarea>
+        </div>
+        <div>
+            <h2 class="text-2xl mb-4">Order Summary</h2>
+            {% for item in cart %}
+            <p>{{ item.product.name }} - {{ item.variant.color }} / {{ item.variant.size }} x {{ item.qty }} = {{ format_money(item.price * item.qty) }}</p>
+            {% endfor %}
+            <p>Subtotal: {{ format_money(subtotal) }}</p>
+            <p>Discount: {{ format_money(discount) }}</p>
+            <div class="mb-4">
+                <label>Shipping Method:</label>
+                <select name="shipping_method">
+                    {% for method in shipping_methods %}
+                    <option value="{{ method.name }}">{{ method.name }} - {{ format_money(method.fee) }}</option>
+                    {% endfor %}
+                </select>
+            </div>
+            <p>Shipping: {{ format_money(shipping_fee) }}</p>
+            <p>Total: {{ format_money(total) }}</p>
+            <button type="submit" class="bg-blue-500 text-white px-6 py-3 rounded hover:bg-blue-600">Continue to Payment</button>
+        </div>
+    </div>
+</form>
+{% endblock %}
+    ''',
+    'payment': '''
+{% extends "base" %}
+{% block title %}Payment - {{ site_name }}{% endblock %}
+{% block content %}
+<h1 class="text-3xl font-bold mb-6">Payment</h1>
+<form method="post" enctype="multipart/form-data">
+    <input type="hidden" name="_csrf_token" value="{{ csrf_token }}">
+    <div class="mb-4">
+        <label>Payment Method:</label>
+        <select name="method">
+            <option value="bkash">bKash</option>
+            <option value="nagad">Nagad</option>
+        </select>
+    </div>
+    <div class="mb-4">
+        <p>For bKash: Send to {{ bkash_number }}. Steps: ...</p>
+        <p>For Nagad: Send to {{ nagad_number }}. Steps: ...</p>
+    </div>
+    <input name="trx_id" placeholder="Transaction ID" class="block w-full border rounded px-2 py-1 mb-2">
+    <input type="file" name="screenshot" class="block w-full mb-2">
+    <button type="submit" class="bg-green-500 text-white px-6 py-3 rounded hover:bg-green-600">Submit Payment</button>
+</form>
+{% endblock %}
+    ''',
+    'thank_you': '''
+{% extends "base" %}
+{% block title %}Thank You - {{ site_name }}{% endblock %}
+{% block content %}
+<h1 class="text-3xl font-bold mb-6">Thank You!</h1>
+<p>Your order #{{ order_id }} has been placed. We'll verify your payment within {{ verification_sla }} hours.</p>
+<a href="/track" class="text-blue-500">Track Order</a>
+{% endblock %}
+    ''',
+    'track': '''
+{% extends "base" %}
+{% block title %}Track Order - {{ site_name }}{% endblock %}
+{% block content %}
+<h1 class="text-3xl font-bold mb-6">Track Order</h1>
+<form method="post">
+    <input type="hidden" name="_csrf_token" value="{{ csrf_token }}">
+    <input name="order_id" placeholder="Order ID" class="border rounded px-2 py-1 mb-2">
+    <input name="phone_or_email" placeholder="Phone or Email" class="border rounded px-2 py-1 mb-2">
+    <button type="submit" class="bg-blue-500 text-white px-4 py-2 rounded">Track</button>
+</form>
+{% if order %}
+<div class="mt-8">
+    <h2>Order #{{ order.order_id }} - Status: {{ order.status }}</h2>
+    <!-- Timeline -->
+    <div class="timeline">
+        <p>Pending Verification</p>
+        <p {% if order.status != 'pending_verification' %}class="text-green-500"{% endif %}>Verified</p>
+        <p {% if order.status in ['processing', 'shipped', 'delivered'] %}class="text-green-500"{% endif %}>Processing</p>
+        <p {% if order.status in ['shipped', 'delivered'] %}class="text-green-500"{% endif %}>Shipped</p>
+        <p {% if order.status == 'delivered' %}class="text-green-500"{% endif %}>Delivered</p>
+    </div>
+    <p>Total: {{ format_money(order.amounts.total) }}</p>
+</div>
+{% endif %}
+{% endblock %}
+    ''',
+    'admin_login': '''
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Admin Login - {{ site_name }}</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-100 flex items-center justify-center h-screen">
+    <form method="post" class="bg-white p-8 rounded shadow">
+        <h1 class="text-2xl mb-4">Admin Login</h1>
+        <input name="username" placeholder="Username" class="block w-full border rounded px-2 py-1 mb-2">
+        <input name="password" type="password" placeholder="Password" class="block w-full border rounded px-2 py-1 mb-4">
+        <button type="submit" class="bg-blue-500 text-white px-4 py-2 rounded">Login</button>
+    </form>
+</body>
+</html>
+    ''',
+    'admin_base': '''
+{% extends "base" %}
+{% block content %}
+<nav class="bg-gray-200 dark:bg-gray-700 p-4 mb-8">
+    <div class="container mx-auto flex space-x-4">
+        <a href="/admin" class="hover:underline">Dashboard</a>
+        <a href="/admin/products" class="hover:underline">Products</a>
+        <a href="/admin/orders" class="hover:underline">Orders</a>
+        <a href="/admin/payments" class="hover:underline">Payments</a>
+        <a href="/admin/coupons" class="hover:underline">Coupons</a>
+        <a href="/admin/shipping" class="hover:underline">Shipping</a>
+        <a href="/admin/settings" class="hover:underline">Settings</a>
+        <a href="/admin/logout" class="hover:underline">Logout</a>
+    </div>
+</nav>
+<div class="container mx-auto p-4">
+    {% block admin_content %}{% endblock %}
+</div>
+{% endblock %}
+    ''',
+    'admin_dashboard': '''
+{% extends "admin_base" %}
+{% block title %}Admin Dashboard - {{ site_name }}{% endblock %}
+{% block admin_content %}
+<h1 class="text-3xl font-bold mb-6">Dashboard</h1>
+<div class="grid grid-cols-1 md:grid-cols-4 gap-4">
+    <div class="bg-white dark:bg-gray-800 p-4 rounded shadow">
+        <h2>Total Products</h2>
+        <p class="text-2xl">{{ total_products }}</p>
+    </div>
+    <div class="bg-white dark:bg-gray-800 p-4 rounded shadow">
+        <h2>Total Orders</h2>
+        <p class="text-2xl">{{ total_orders }}</p>
+    </div>
+    <div class="bg-white dark:bg-gray-800 p-4 rounded shadow">
+        <h2>Pending Verifications</h2>
+        <p class="text-2xl">{{ pending_verifications }}</p>
+    </div>
+    <div class="bg-white dark:bg-gray-800 p-4 rounded shadow">
+        <h2>Revenue (30 days)</h2>
+        <p class="text-2xl">{{ format_money(revenue) }}</p>
+    </div>
+</div>
+{% endblock %}
+    ''',
+    'admin_products_list': '''
+{% extends "admin_base" %}
+{% block title %}Admin Products - {{ site_name }}{% endblock %}
+{% block admin_content %}
+<h1 class="text-3xl font-bold mb-6">Products</h1>
+<a href="/admin/products/new" class="bg-green-500 text-white px-4 py-2 rounded mb-4">Add New Product</a>
+<table class="w-full border-collapse">
+    <thead>
+        <tr>
+            <th>Name</th>
+            <th>Price</th>
+            <th>Status</th>
+            <th>Actions</th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for product in products %}
+        <tr>
+            <td>{{ product.name }}</td>
+            <td>{{ format_money(product.price) }}</td>
+            <td>{{ product.status }}</td>
+            <td>
+                <a href="/admin/products/{{ product._id }}/edit" class="text-blue-500">Edit</a>
+                <button hx-post="/admin/products/{{ product._id }}/delete" hx-confirm="Are you sure?" class="text-red-500">Delete</button>
+            </td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+{% endblock %}
+    ''',
+    'admin_product_edit': '''
+{% extends "admin_base" %}
+{% block title %}Edit Product - {{ site_name }}{% endblock %}
+{% block admin_content %}
+<h1 class="text-3xl font-bold mb-6">Edit Product</h1>
+<form method="post" enctype="multipart/form-data">
+    <input type="hidden" name="_csrf_token" value="{{ csrf_token }}">
+    <input name="name" value="{{ product.name }}" placeholder="Name" class="block w-full border rounded px-2 py-1 mb-2">
+    <input name="category" value="{{ product.category }}" placeholder="Category" class="block w-full border rounded px-2 py-1 mb-2">
+    <textarea name="description" placeholder="Description" class="block w-full border rounded px-2 py-1 mb-2">{{ product.description }}</textarea>
+    <input name="price" type="number" value="{{ product.price }}" placeholder="Price" class="block w-full border rounded px-2 py-1 mb-2">
+    <input name="compare_at_price" type="number" value="{{ product.compare_at_price }}" placeholder="Compare At Price" class="block w-full border rounded px-2 py-1 mb-2">
+    <select name="status" class="block w-full border rounded px-2 py-1 mb-2">
+        <option value="draft" {% if product.status == 'draft' %}selected{% endif %}>Draft</option>
+        <option value="active" {% if product.status == 'active' %}selected{% endif %}>Active</option>
+    </select>
+    <div x-data="{ variants: {{ product.variants | tojson | safe }} || [] }">
+        <h3>Variants</h3>
+        <table class="w-full mb-4">
+            <thead>
+                <tr>
+                    <th>Color</th>
+                    <th>Size</th>
+                    <th>SKU</th>
+                    <th>Stock</th>
+                    <th>Price Override</th>
+                    <th>Actions</th>
+                </tr>
+            </thead>
+            <tbody x-ref="variantsTable">
+                <template x-for="(v, index) in variants" :key="index">
+                    <tr>
+                        <td><input x-model="variants[index].color" class="border rounded px-2 py-1"></td>
+                        <td><input x-model="variants[index].size" class="border rounded px-2 py-1"></td>
+                        <td><input x-model="variants[index].sku" class="border rounded px-2 py-1"></td>
+                        <td><input type="number" x-model="variants[index].stock" class="border rounded px-2 py-1"></td>
+                        <td><input type="number" x-model="variants[index].price_override" class="border rounded px-2 py-1"></td>
+                        <td><button @click="variants.splice(index, 1)" class="text-red-500">Remove</button></td>
+                    </tr>
+                </template>
+            </tbody>
+        </table>
+        <button type="button" @click="variants.push({color: '', size: '', sku: '', stock: 0, price_override: null})" class="bg-blue-500 text-white px-4 py-2 rounded mb-4">Add Variant</button>
+        <input type="hidden" name="variants" x-bind:value="JSON.stringify(variants)">
+    </div>
+    <div>
+        <h3>Images</h3>
+        <form hx-post="/admin/products/{{ product._id }}/upload_image" hx-target="#images-list" hx-swap="innerHTML" enctype="multipart/form-data">
+            <input type="file" name="image">
+            <button type="submit">Upload</button>
+        </form>
+        <div id="images-list">
+            {% for img in product.images %}
+            <div class="flex items-center mb-2">
+                <img src="/uploads/{{ img }}" width="100" class="mr-2">
+                <button hx-post="/admin/products/{{ product._id }}/move_image?index={{ loop.index0 }}&dir=up" hx-target="#images-list" hx-swap="innerHTML">Up</button>
+                <button hx-post="/admin/products/{{ product._id }}/move_image?index={{ loop.index0 }}&dir=down" hx-target="#images-list" hx-swap="innerHTML">Down</button>
+                <button hx-post="/admin/products/{{ product._id }}/delete_image?index={{ loop.index0 }}" hx-target="#images-list" hx-swap="innerHTML" class="text-red-500">Delete</button>
+            </div>
+            {% endfor %}
+        </div>
+    </div>
+    <button type="submit" class="bg-green-500 text-white px-6 py-3 rounded mt-4">Save</button>
+</form>
+{% endblock %}
+    ''',
+    'images_list': '''
+{% for img in product.images %}
+<div class="flex items-center mb-2">
+    <img src="/uploads/{{ img }}" width="100" class="mr-2">
+    <button hx-post="/admin/products/{{ product._id }}/move_image?index={{ loop.index0 }}&dir=up" hx-target="#images-list" hx-swap="innerHTML">Up</button>
+    <button hx-post="/admin/products/{{ product._id }}/move_image?index={{ loop.index0 }}&dir=down" hx-target="#images-list" hx-swap="innerHTML">Down</button>
+    <button hx-post="/admin/products/{{ product._id }}/delete_image?index={{ loop.index0 }}" hx-target="#images-list" hx-swap="innerHTML" class="text-red-500">Delete</button>
+</div>
+{% endfor %}
+    ''',
+    'admin_orders_list': '''
+{% extends "admin_base" %}
+{% block title %}Admin Orders - {{ site_name }}{% endblock %}
+{% block admin_content %}
+<h1 class="text-3xl font-bold mb-6">Orders</h1>
+<a href="/admin/orders/export" class="bg-blue-500 text-white px-4 py-2 rounded mb-4">Export CSV</a>
+<table class="w-full border-collapse">
+    <thead>
+        <tr>
+            <th>Order ID</th>
+            <th>Customer</th>
+            <th>Total</th>
+            <th>Status</th>
+            <th>Created</th>
+            <th>Actions</th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for order in orders %}
+        <tr id="order-{{ order.order_id }}">
+            <td>{{ order.order_id }}</td>
+            <td>{{ order.customer.name }} ({{ order.customer.phone }})</td>
+            <td>{{ format_money(order.amounts.total) }}</td>
+            <td>
+                <select hx-post="/admin/orders/{{ order._id }}/update_status" hx-vals='js:{status: event.target.value}' hx-target="#order-{{ order.order_id }}" hx-swap="outerHTML">
+                    <option value="pending_verification" {% if order.status == 'pending_verification' %}selected{% endif %}>Pending Verification</option>
+                    <option value="verified" {% if order.status == 'verified' %}selected{% endif %}>Verified</option>
+                    <option value="processing" {% if order.status == 'processing' %}selected{% endif %}>Processing</option>
+                    <option value="shipped" {% if order.status == 'shipped' %}selected{% endif %}>Shipped</option>
+                    <option value="delivered" {% if order.status == 'delivered' %}selected{% endif %}>Delivered</option>
+                    <option value="canceled" {% if order.status == 'canceled' %}selected{% endif %}>Canceled</option>
+                    <option value="refunded" {% if order.status == 'refunded' %}selected{% endif %}>Refunded</option>
+                </select>
+            </td>
+            <td>{{ order.created_at.strftime('%Y-%m-%d') }}</td>
+            <td>
+                <a href="/admin/orders/{{ order._id }}" class="text-blue-500">View</a>
+            </td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+{% endblock %}
+    ''',
+    'order_row': '''
+<td>{{ order.order_id }}</td>
+<td>{{ order.customer.name }} ({{ order.customer.phone }})</td>
+<td>{{ format_money(order.amounts.total) }}</td>
+<td>
+    <select hx-post="/admin/orders/{{ order._id }}/update_status" hx-vals='js:{status: event.target.value}' hx-target="#order-{{ order.order_id }}" hx-swap="outerHTML">
+        <option value="pending_verification" {% if order.status == 'pending_verification' %}selected{% endif %}>Pending Verification</option>
+        <option value="verified" {% if order.status == 'verified' %}selected{% endif %}>Verified</option>
+        <option value="processing" {% if order.status == 'processing' %}selected{% endif %}>Processing</option>
+        <option value="shipped" {% if order.status == 'shipped' %}selected{% endif %}>Shipped</option>
+        <option value="delivered" {% if order.status == 'delivered' %}selected{% endif %}>Delivered</option>
+        <option value="canceled" {% if order.status == 'canceled' %}selected{% endif %}>Canceled</option>
+        <option value="refunded" {% if order.status == 'refunded' %}selected{% endif %}>Refunded</option>
+    </select>
+</td>
+<td>{{ order.created_at.strftime('%Y-%m-%d') }}</td>
+<td>
+    <a href="/admin/orders/{{ order._id }}" class="text-blue-500">View</a>
+</td>
+    ''',
+    'admin_order_detail': '''
+{% extends "admin_base" %}
+{% block title %}Order #{{ order.order_id }} - {{ site_name }}{% endblock %}
+{% block admin_content %}
+<h1 class="text-3xl font-bold mb-6">Order #{{ order.order_id }}</h1>
+<p>Status: {{ order.status }}</p>
+<p>Customer: {{ order.customer.name }}, {{ order.customer.phone }}, {{ order.customer.email }}</p>
+<p>Address: {{ order.shipping.address }}, {{ order.shipping.city }}, {{ order.postal_code }}</p>
+<p>Payment: {{ order.payment.method.upper() }}, TRX: {{ order.payment.trx_id }}, Verified: {{ order.payment.verified }}</p>
+{% if order.payment.screenshot_path %}
+<img src="/uploads/{{ order.payment.screenshot_path }}" width="200" alt="Screenshot">
+{% endif %}
+<div class="mt-4">
+    <h2>Items</h2>
+    {% for item in order.items %}
+    <p>{{ item.product_id }} - {{ item.variant.color }} / {{ item.variant.size }} x {{ item.qty }} = {{ format_money(item.price * item.qty) }}</p>
+    {% endfor %}
+</div>
+<p>Total: {{ format_money(order.amounts.total) }}</p>
+<form method="post" action="/admin/orders/{{ order._id }}/cancel">
+    <input type="hidden" name="_csrf_token" value="{{ csrf_token }}">
+    <input name="notes" placeholder="Cancel/Refund Notes" class="border rounded px-2 py-1 mb-2">
+    <button type="submit" class="bg-red-500 text-white px-4 py-2 rounded">Cancel/Refund</button>
+</form>
+{% endblock %}
+    ''',
+    'admin_payments': '''
+{% extends "admin_base" %}
+{% block title %}Payment Verifications - {{ site_name }}{% endblock %}
+{% block admin_content %}
+<h1 class="text-3xl font-bold mb-6">Pending Payment Verifications</h1>
+<table class="w-full border-collapse">
+    <thead>
+        <tr>
+            <th>Order ID</th>
+            <th>TRX ID</th>
+            <th>Screenshot</th>
+            <th>Actions</th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for order in pending_orders %}
+        <tr>
+            <td>{{ order.order_id }}</td>
+            <td>{{ order.payment.trx_id }}</td>
+            <td>
+                {% if order.payment.screenshot_path %}
+                <img src="/uploads/{{ order.payment.screenshot_path }}" width="100">
+                {% endif %}
+            </td>
+            <td>
+                <button hx-post="/admin/orders/{{ order._id }}/verify" hx-target="body" class="bg-green-500 text-white px-4 py-2 rounded">Verify</button>
+                <button hx-post="/admin/orders/{{ order._id }}/reject" hx-target="body" class="bg-red-500 text-white px-4 py-2 rounded">Reject</button>
+            </td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+{% endblock %}
+    ''',
+    'admin_coupons': '''
+{% extends "admin_base" %}
+{% block title %}Coupons - {{ site_name }}{% endblock %}
+{% block admin_content %}
+<h1 class="text-3xl font-bold mb-6">Coupons</h1>
+<form method="post" action="/admin/coupons/new">
+    <input type="hidden" name="_csrf_token" value="{{ csrf_token }}">
+    <input name="code" placeholder="Code" class="border rounded px-2 py-1 mb-2">
+    <select name="type">
+        <option value="percent">Percent</option>
+        <option value="fixed">Fixed</option>
+    </select>
+    <input name="value" type="number" placeholder="Value" class="border rounded px-2 py-1 mb-2">
+    <input name="min_order" type="number" placeholder="Min Order" class="border rounded px-2 py-1 mb-2">
+    <input name="usage_limit" type="number" placeholder="Usage Limit" class="border rounded px-2 py-1 mb-2">
+    <input name="expires_at" type="date" placeholder="Expires At" class="border rounded px-2 py-1 mb-2">
+    <button type="submit" class="bg-green-500 text-white px-4 py-2 rounded">Add Coupon</button>
+</form>
+<table class="w-full mt-8">
+    <thead>
+        <tr>
+            <th>Code</th>
+            <th>Type</th>
+            <th>Value</th>
+            <th>Active</th>
+            <th>Actions</th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for coupon in coupons %}
+        <tr>
+            <td>{{ coupon.code }}</td>
+            <td>{{ coupon.type }}</td>
+            <td>{{ coupon.value }}</td>
+            <td>{{ coupon.active }}</td>
+            <td>
+                <button hx-post="/admin/coupons/{{ coupon._id }}/delete" class="text-red-500">Delete</button>
+            </td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+{% endblock %}
+    ''',
+    'admin_shipping': '''
+{% extends "admin_base" %}
+{% block title %}Shipping - {{ site_name }}{% endblock %}
+{% block admin_content %}
+<h1 class="text-3xl font-bold mb-6">Shipping Methods</h1>
+<form method="post" action="/admin/shipping/update">
+    <input type="hidden" name="_csrf_token" value="{{ csrf_token }}">
+    <div x-data="{ methods: {{ shipping_methods | tojson | safe }} }">
+        <template x-for="(m, index) in methods" :key="index">
+            <div class="flex mb-2">
+                <input x-model="methods[index].name" placeholder="Name" class="border rounded px-2 py-1 mr-2">
+                <input type="number" x-model="methods[index].fee" placeholder="Fee" class="border rounded px-2 py-1 mr-2">
+                <button @click="methods.splice(index, 1)" class="text-red-500">Remove</button>
+            </div>
+        </template>
+        <button type="button" @click="methods.push({name: '', fee: 0})" class="bg-blue-500 text-white px-4 py-2 rounded mb-4">Add Method</button>
+        <input type="hidden" name="shipping_methods" x-bind:value="JSON.stringify(methods)">
+    </div>
+    <input name="free_shipping_threshold" type="number" value="{{ free_shipping_threshold }}" placeholder="Free Shipping Threshold" class="block w-full border rounded px-2 py-1 mb-2">
+    <button type="submit" class="bg-green-500 text-white px-4 py-2 rounded">Save</button>
+</form>
+{% endblock %}
+    ''',
+    'admin_settings': '''
+{% extends "admin_base" %}
+{% block title %}Settings - {{ site_name }}{% endblock %}
+{% block admin_content %}
+<h1 class="text-3xl font-bold mb-6">Settings</h1>
+<form method="post">
+    <input type="hidden" name="_csrf_token" value="{{ csrf_token }}">
+    <input name="brand" value="{{ brand }}" placeholder="Brand Name" class="block w-full border rounded px-2 py-1 mb-2">
+    <input name="support_phone" value="{{ support_phone }}" placeholder="Support Phone" class="block w-full border rounded px-2 py-1 mb-2">
+    <input name="support_email" value="{{ support_email }}" placeholder="Support Email" class="block w-full border rounded px-2 py-1 mb-2">
+    <input name="bkash_number" value="{{ bkash_number }}" placeholder="bKash Number" class="block w-full border rounded px-2 py-1 mb-2">
+    <input name="nagad_number" value="{{ nagad_number }}" placeholder="Nagad Number" class="block w-full border rounded px-2 py-1 mb-2">
+    <input name="verification_sla" value="{{ verification_sla }}" placeholder="Verification SLA (hours)" class="block w-full border rounded px-2 py-1 mb-2">
+    <label>Maintenance Mode: <input type="checkbox" name="maintenance" {% if maintenance %}checked{% endif %}></label>
+    <button type="submit" class="bg-green-500 text-white px-6 py-3 rounded mt-4">Save</button>
+</form>
+{% endblock %}
+    '''
+}
+
+env = Environment(loader=DictLoader(templates))
+
+# Routes
+
+@app.route('/health')
+def health():
+    return jsonify({'status': 'ok'})
+
+@app.route('/uploads/<filename>')
+def uploaded_file(filename):
+    return send_from_directory(ASSET_DIR, filename)
+
+@app.route('/', methods=['GET'])
+def home():
+    query = {'status': 'active'}
+    search = request.args.get('search')
+    if search:
+        query['name'] = {'$regex': search, '$options': 'i'}
+    category = request.args.get('category')
+    if category:
+        query['category'] = category
+    color = request.args.get('color')
+    if color:
+        query['colors'] = color
+    size = request.args.get('size')
+    if size:
+        query['sizes'] = size
+    min_price = request.args.get('min_price', type=float)
+    max_price = request.args.get('max_price', type=float)
+    if min_price or max_price:
+        price_query = {}
+        if min_price:
+            price_query['$gte'] = min_price
+        if max_price:
+            price_query['$lte'] = max_price
+        query['price'] = price_query
+    in_stock = request.args.get('in_stock')
+    if in_stock:
+        query['variants'] = {'$elemMatch': {'stock': {'$gt': 0}}}
+    page = request.args.get('page', 1, type=int)
+    per_page = 12
+    skip = (page - 1) * per_page
+    products = list(products_db.find(query).skip(skip).limit(per_page))
+    total = products_db.count_documents(query)
+    pages = (total // per_page) + (1 if total % per_page else 0)
+    s = get_settings()
+    t = env.get_template('home')
+    return t.render(products=products, page=page, pages=pages, format_money=format_money, site_name=SITE_NAME, support_phone=s['support_phone'], support_email=s['support_email'], year=datetime.datetime.now().year, session=session)
+
+@app.route('/p/<slug>', methods=['GET'])
+def product_detail(slug):
+    product = products_db.find_one({'slug': slug})
+    if not product:
+        abort(404)
+    reviews = list(reviews_db.find({'product_id': product['_id'], 'approved': True}))
+    avg_rating = reviews_db.aggregate([{'$match': {'product_id': product['_id'], 'approved': True}}, {'$group': {'_id': None, 'avg': {'$avg': '$rating'}}}])
+    avg_rating = list(avg_rating)
+    product['avg_rating'] = avg_rating[0]['avg'] if avg_rating else 0
+    s = get_settings()
+    t = env.get_template('product_detail')
+    return t.render(product=product, reviews=reviews, format_money=format_money, site_name=SITE_NAME, support_phone=s['support_phone'], support_email=s['support_email'], year=datetime.datetime.now().year, csrf_token=session['_csrf_token'])
+
+@app.route('/p/<slug>/review', methods=['POST'])
+def product_review(slug):
+    if request.form['_csrf_token'] != session['_csrf_token']:
+        abort(403)
+    product = products_db.find_one({'slug': slug})
+    if not product:
+        abort(404)
+    review = {
+        'product_id': product['_id'],
+        'name': request.form['name'],
+        'rating': int(request.form['rating']),
+        'comment': request.form['comment'],
+        'created_at': datetime.datetime.utcnow(),
+        'approved': True  # Auto approve for simplicity
+    }
+    reviews_db.insert_one(review)
+    return redirect(url_for('product_detail', slug=slug))
+
+@app.route('/cart', methods=['GET'])
+def cart():
+    cart = session.get('cart', [])
+    subtotal = 0
+    for item in cart:
+        item['product'] = products_db.find_one({'_id': ObjectId(item['product_id'])})
+        item['price'] = item['variant'].get('price_override') or item['product']['price']
+        subtotal += item['price'] * item['qty']
+    discount = session.get('discount', 0)
+    total = subtotal - discount
+    s = get_settings()
+    t = env.get_template('cart')
+    return t.render(cart=cart, subtotal=subtotal, discount=discount, total=total, format_money=format_money, site_name=SITE_NAME, support_phone=s['support_phone'], support_email=s['support_email'], year=datetime.datetime.now().year)
+
+@app.route('/cart/add', methods=['POST'])
+def cart_add():
+    product_id = request.form['product_id']
+    color = request.form['color']
+    size = request.form['size']
+    qty = int(request.form['qty'])
+    product = products_db.find_one({'_id': ObjectId(product_id)})
+    variant = next((v for v in product['variants'] if v['color'] == color and v['size'] == size), None)
+    if not variant or variant['stock'] < qty:
+        return 'Out of stock', 400
+    cart = session.get('cart', [])
+    for item in cart:
+        if item['product_id'] == product_id and item['variant']['color'] == color and item['variant']['size'] == size:
+            item['qty'] += qty
+            break
+    else:
+        cart.append({'product_id': product_id, 'variant': variant, 'qty': qty})
+    session['cart'] = cart
+    return '', 200  # For HTMX
+
+@app.route('/cart/remove', methods=['POST'])
+def cart_remove():
+    index = int(request.form['index'])
+    cart = session.get('cart', [])
+    if 0 <= index < len(cart):
+        del cart[index]
+    session['cart'] = cart
+    return cart()  # Return updated cart HTML for HTMX
+
+@app.route('/cart/apply_coupon', methods=['POST'])
+def apply_coupon():
+    code = request.form['code']
+    coupon = coupons_db.find_one({'code': code, 'active': True})
+    if not coupon:
+        return '<p>Invalid coupon</p>', 400
+    # Check expires, usage etc.
+    if coupon['expires_at'] and coupon['expires_at'] < datetime.datetime.utcnow():
+        return '<p>Coupon expired</p>', 400
+    if coupon['usage_limit'] and coupon['used_count'] >= coupon['usage_limit']:
+        return '<p>Coupon usage limit reached</p>', 400
+    cart = session.get('cart', [])
+    subtotal = sum((v.get('price_override') or p['price']) * i['qty'] for i in cart for p in [products_db.find_one({'_id': ObjectId(i['product_id'])})] for v in [i['variant']])
+    if subtotal < coupon['min_order']:
+        return '<p>Min order not met</p>', 400
+    discount = (coupon['value'] / 100 * subtotal) if coupon['type'] == 'percent' else coupon['value']
+    session['discount'] = discount
+    session['coupon_code'] = code
+    total = subtotal - discount
+    return f'''
+<p>Subtotal: {format_money(subtotal)}</p>
+<p>Discount: {format_money(discount)}</p>
+<p>Total: {format_money(total)}</p>
+    '''
+
+@app.route('/checkout', methods=['GET', 'POST'])
+def checkout():
+    if request.method == 'POST':
+        if request.form['_csrf_token'] != session['_csrf_token']:
+            abort(403)
+        session['customer'] = {
+            'name': request.form['name'],
+            'phone': request.form['phone'],
+            'email': request.form['email'],
+        }
+        session['shipping'] = {
+            'address': request.form['address'],
+            'city': request.form['city'],
+            'postal_code': request.form['postal_code'],
+            'method': request.form['shipping_method'],
+            'note': request.form.get('delivery_note', '')
+        }
+        return redirect(url_for('payment'))
+    cart = session.get('cart', [])
+    subtotal = 0
+    for item in cart:
+        product = products_db.find_one({'_id': ObjectId(item['product_id'])})
+        price = item['variant'].get('price_override') or product['price']
+        subtotal += price * item['qty']
+    discount = session.get('discount', 0)
+    s = get_settings()
+    shipping_methods = s['shipping_methods']
+    shipping_fee = next((m['fee'] for m in shipping_methods if m['name'] == request.form.get('shipping_method', shipping_methods[0]['name'])), 0)
+    if subtotal >= s['free_shipping_threshold']:
+        shipping_fee = 0
+    total = subtotal - discount + shipping_fee
+    t = env.get_template('checkout')
+    return t.render(cart=cart, subtotal=subtotal, discount=discount, shipping_fee=shipping_fee, total=total, format_money=format_money, shipping_methods=shipping_methods, site_name=SITE_NAME, support_phone=s['support_phone'], support_email=s['support_email'], year=datetime.datetime.now().year, csrf_token=session['_csrf_token'])
+
+@app.route('/payment', methods=['GET', 'POST'])
+def payment():
+    if 'cart' not in session or not session['cart']:
+        return redirect('/cart')
+    if request.method == 'POST':
+        if request.form['_csrf_token'] != session['_csrf_token']:
+            abort(403)
+        screenshot = upload_file(request.files.get('screenshot'), resize=(400,400), quality=70)
+        if not screenshot:
+            return 'Screenshot required', 400
+        cart = session.pop('cart', [])
+        customer = session.pop('customer', {})
+        shipping = session.pop('shipping', {})
+        discount = session.pop('discount', 0)
+        coupon_code = session.pop('coupon_code', None)
+        if coupon_code:
+            coupons_db.update_one({'code': coupon_code}, {'$inc': {'used_count': 1}})
+        items = []
+        subtotal = 0
+        for i in cart:
+            product = products_db.find_one({'_id': ObjectId(i['product_id'])})
+            variant = i['variant']
+            price = variant.get('price_override') or product['price']
+            subtotal += price * i['qty']
+            items.append({
+                'product_id': i['product_id'],
+                'product': product,  # For display, but remove sensitive
+                'variant': variant,
+                'qty': i['qty'],
+                'price': price
+            })
+            # Reduce stock
+            products_db.update_one({'_id': ObjectId(i['product_id']), 'variants.color': variant['color'], 'variants.size': variant['size']}, {'$inc': {'variants.$.stock': -i['qty']}})
+        shipping_fee = next((m['fee'] for m in get_settings()['shipping_methods'] if m['name'] == shipping['method']), 0)
+        if subtotal >= get_settings()['free_shipping_threshold']:
+            shipping_fee = 0
+        total = subtotal - discount + shipping_fee
+        order = {
+            'order_id': get_next_sequence('order_id'),
+            'items': [ {k: v for k, v in item.items() if k != 'product'} for item in items ],  # No full product
+            'amounts': {
+                'subtotal': subtotal,
+                'discount': discount,
+                'shipping': shipping_fee,
+                'total': total,
+                'currency': 'BDT'
+            },
+            'customer': customer,
+            'shipping': shipping,
+            'payment': {
+                'method': request.form['method'],
+                'trx_id': request.form['trx_id'],
+                'screenshot_path': screenshot,
+                'verified': False,
+                'verified_at': None,
+                'verified_by': None
+            },
+            'status': 'pending_verification',
+            'notes': [],
+            'created_at': datetime.datetime.utcnow(),
+            'updated_at': datetime.datetime.utcnow()
+        }
+        orders_db.insert_one(order)
+        # Placeholder for email/telegram notification
+        # send_notification(order)
+        return redirect(url_for('thank_you', order_id=order['order_id']))
+    s = get_settings()
+    t = env.get_template('payment')
+    return t.render(bkash_number=s['bkash_number'], nagad_number=s['nagad_number'], site_name=SITE_NAME, support_phone=s['support_phone'], support
